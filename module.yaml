@@ -36,8 +36,8 @@ spec:
     - name: kubernetes_version
       description: >-
         Kubernetes version. capd (default v1.34.8): a kindest/node image tag
-        must exist for it. gke (default v1.35.8): a version GKE's regular
-        channel offers in us-central1-a.
+        must exist for it. gke (default v1.35.8): a version the gke
+        ClusterClass's GKE release channel offers in its location.
     - name: control_plane_count
       description: Control plane machines (capd only — GKE manages its own)
       default: "1"
