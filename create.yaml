@@ -1,0 +1,131 @@
+apiVersion: v1
+kind: Workflow
+metadata:
+  name: create
+  description: >-
+    Applies a topology-managed CAPI Cluster built from the ClusterClass, and
+    returns — CAPI provisions it asynchronously and status.yaml reports
+    CREATING until it's Available. Idempotent: re-applying an existing
+    Cluster changes nothing (scale.yaml owns changes).
+spec:
+  jobs:
+    - name: create
+      steps:
+        - name: connect
+          script: |
+            name="$HYVE_CLUSTER_NAME"
+            ns="${HYVE_PARAM_NAMESPACE:-capi-clusters}"
+            if [ -z "$HYVE_MGMT_KUBECONFIG" ]; then
+              echo "Error: HYVE_MGMT_KUBECONFIG is not set — hyve provides it for modules with requirements.mgmtCluster" >&2
+              exit 1
+            fi
+            mk() { kubectl --kubeconfig "$HYVE_MGMT_KUBECONFIG" -n "$ns" "$@"; }
+
+        - name: params
+          script: |
+            # flavor picks the cluster's shape: capd (Docker nodes via the
+            # capd ClusterClass — kubeadm control plane, MachineDeployment
+            # workers, flannel, NodePort relay) or gke (managed GKE via the
+            # gke ClusterClass — MachinePool workers, GKE's own CNI and
+            # public endpoint).
+            flavor="${HYVE_PARAM_FLAVOR:-capd}"
+            case "$flavor" in
+              capd) class="${HYVE_PARAM_CLUSTER_CLASS:-capd}"; version="${HYVE_PARAM_KUBERNETES_VERSION:-v1.34.8}" ;;
+              gke)  class="${HYVE_PARAM_CLUSTER_CLASS:-gke}";  version="${HYVE_PARAM_KUBERNETES_VERSION:-v1.35.8}" ;;
+              *) echo "Error: flavor must be capd or gke (got '$flavor')" >&2; exit 1 ;;
+            esac
+            cp_count="${HYVE_PARAM_CONTROL_PLANE_COUNT:-1}"
+            workers="${HYVE_PARAM_WORKER_COUNT:-1}"
+            for n in "$cp_count" "$workers"; do
+              case "$n" in
+                ''|*[!0-9]*) echo "Error: control_plane_count/worker_count must be whole numbers (got '$n')" >&2; exit 1 ;;
+              esac
+            done
+
+            if ! mk get clusterclasses.v1beta2.cluster.x-k8s.io "$class" -o name >/dev/null 2>&1; then
+              echo "Error: ClusterClass $ns/$class not found on the management cluster — see this module's README for the ClusterClasses it expects" >&2
+              exit 1
+            fi
+
+            api_host=""
+            if [ "$flavor" = "capd" ]; then
+              # The address hyve will reach the API server on (auth.yaml's
+              # NodePort relay on the management node), baked into the API
+              # server's certificate now — certSANs can't be added later
+              # without rolling the control plane.
+              api_host="$HYVE_PARAM_API_HOST"
+              if [ -z "$api_host" ]; then
+                api_host=$(kubectl --kubeconfig "$HYVE_MGMT_KUBECONFIG" get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+              fi
+              if [ -z "$api_host" ]; then
+                echo "Error: couldn't determine the management node's IP — set params.api_host" >&2
+                exit 1
+              fi
+            fi
+
+        - name: apply
+          script: |
+            if [ "$flavor" = "capd" ]; then
+              echo "Applying Cluster $ns/$name ($class, $version, $cp_count control plane, $workers workers)..."
+              # cni: flannel is for a ClusterResourceSet that installs the
+              # CNI (see README); the pod CIDR matches flannel's default.
+              mk apply -f - <<CLUSTER
+            apiVersion: cluster.x-k8s.io/v1beta2
+            kind: Cluster
+            metadata:
+              name: $name
+              namespace: $ns
+              labels:
+                cni: flannel
+                app.kubernetes.io/managed-by: hyve
+            spec:
+              clusterNetwork:
+                pods:
+                  cidrBlocks: ["10.244.0.0/16"]
+                services:
+                  cidrBlocks: ["10.128.0.0/12"]
+                serviceDomain: cluster.local
+              topology:
+                classRef:
+                  name: $class
+                version: $version
+                controlPlane:
+                  replicas: $cp_count
+                workers:
+                  machineDeployments:
+                    - class: default-worker
+                      name: md-0
+                      replicas: $workers
+                variables:
+                  - name: extraCertSANs
+                    value: ["$api_host"]
+            CLUSTER
+              echo "HYVE_CAPI_API_HOST=$api_host"
+            else
+              machine_type="${HYVE_PARAM_MACHINE_TYPE:-e2-medium}"
+              echo "Applying Cluster $ns/$name ($class, $version, $workers x $machine_type)..."
+              # GKE manages the control plane (no replica count) and brings
+              # its own pod networking, so no clusterNetwork or CNI label.
+              mk apply -f - <<CLUSTER
+            apiVersion: cluster.x-k8s.io/v1beta2
+            kind: Cluster
+            metadata:
+              name: $name
+              namespace: $ns
+              labels:
+                app.kubernetes.io/managed-by: hyve
+            spec:
+              topology:
+                classRef:
+                  name: $class
+                version: $version
+                workers:
+                  machinePools:
+                    - class: default-worker
+                      name: mp-0
+                      replicas: $workers
+                variables:
+                  - name: machineType
+                    value: "$machine_type"
+            CLUSTER
+            fi

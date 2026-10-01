@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: Workflow
+metadata:
+  name: delete
+  description: >-
+    Deletes the CAPI Cluster and waits for it to be gone — hyve removes the
+    cluster's definition as soon as this succeeds, without checking status
+    again. CAPI's finalizers tear down workers, then the control plane, then
+    the infrastructure; the NodePort relay auth.yaml created is owned by the
+    Cluster and garbage-collected with it. The wait stops just short of
+    cluster mode's 15-minute Job deadline: if deletion takes longer, this
+    fails and hyve keeps checking (status reports DELETING) until it's gone.
+spec:
+  jobs:
+    - name: delete
+      steps:
+        - name: connect
+          script: |
+            name="$HYVE_CLUSTER_NAME"
+            ns="${HYVE_PARAM_NAMESPACE:-capi-clusters}"
+            if [ -z "$HYVE_MGMT_KUBECONFIG" ]; then
+              echo "Error: HYVE_MGMT_KUBECONFIG is not set — hyve provides it for modules with requirements.mgmtCluster" >&2
+              exit 1
+            fi
+            mk() { kubectl --kubeconfig "$HYVE_MGMT_KUBECONFIG" -n "$ns" "$@"; }
+            cluster_res=clusters.v1beta2.cluster.x-k8s.io
+
+            cluster_exists() {
+              if out=$(mk get "$cluster_res" "$name" -o name 2>&1); then
+                return 0
+              fi
+              case "$out" in
+                *NotFound*|*"not found"*) return 1 ;;
+              esac
+              echo "Error: can't read Cluster $ns/$name from the management cluster: $out" >&2
+              exit 1
+            }
+
+        - name: delete
+          script: |
+            if ! cluster_exists; then
+              echo "Cluster $ns/$name already gone"
+              exit 0
+            fi
+            mk delete "$cluster_res" "$name" --wait=false
+
+            limit=840
+            waited=0
+            while cluster_exists; do
+              if [ "$waited" -ge "$limit" ]; then
+                echo "Error: $ns/$name still deleting after ${limit}s — hyve will keep checking until it's gone" >&2
+                exit 1
+              fi
+              sleep 10
+              waited=$((waited + 10))
+            done
+            echo "✅ Cluster $ns/$name deleted"

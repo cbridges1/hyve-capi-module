@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: Workflow
+metadata:
+  name: scale
+  description: >-
+    hyve runs this on any params change, so it applies all of them:
+    kubernetes_version (an upgrade), control_plane_count, and worker_count,
+    as one patch to the Cluster's topology. CAPI rolls the machines;
+    status.yaml reports UPDATING meanwhile. cluster_class, namespace, and
+    api_host can't change on a live cluster — recreate it instead.
+spec:
+  jobs:
+    - name: scale
+      steps:
+        - name: connect
+          script: |
+            name="$HYVE_CLUSTER_NAME"
+            ns="${HYVE_PARAM_NAMESPACE:-capi-clusters}"
+            if [ -z "$HYVE_MGMT_KUBECONFIG" ]; then
+              echo "Error: HYVE_MGMT_KUBECONFIG is not set — hyve provides it for modules with requirements.mgmtCluster" >&2
+              exit 1
+            fi
+            mk() { kubectl --kubeconfig "$HYVE_MGMT_KUBECONFIG" -n "$ns" "$@"; }
+            cluster_res=clusters.v1beta2.cluster.x-k8s.io
+
+        - name: patch
+          script: |
+            flavor="${HYVE_PARAM_FLAVOR:-capd}"
+            case "$flavor" in
+              capd) version="${HYVE_PARAM_KUBERNETES_VERSION:-v1.34.8}"; wanted_class="${HYVE_PARAM_CLUSTER_CLASS:-capd}" ;;
+              gke)  version="${HYVE_PARAM_KUBERNETES_VERSION:-v1.35.8}"; wanted_class="${HYVE_PARAM_CLUSTER_CLASS:-gke}" ;;
+              *) echo "Error: flavor must be capd or gke (got '$flavor')" >&2; exit 1 ;;
+            esac
+            cp_count="${HYVE_PARAM_CONTROL_PLANE_COUNT:-1}"
+            workers="${HYVE_PARAM_WORKER_COUNT:-1}"
+            for n in "$cp_count" "$workers"; do
+              case "$n" in
+                ''|*[!0-9]*) echo "Error: control_plane_count/worker_count must be whole numbers (got '$n')" >&2; exit 1 ;;
+              esac
+            done
+
+            current_class=$(mk get "$cluster_res" "$name" -o jsonpath='{.spec.topology.classRef.name}')
+            if [ "$current_class" != "$wanted_class" ]; then
+              echo "⚠️  cluster_class/flavor changed ($current_class → $wanted_class) — not applied; recreate the cluster to change it"
+            fi
+
+            if [ "$flavor" = "capd" ]; then
+              echo "Patching $ns/$name: version $version, $cp_count control plane, $workers workers"
+              mk patch "$cluster_res" "$name" --type merge -p "{\"spec\":{\"topology\":{\"version\":\"$version\",\"controlPlane\":{\"replicas\":$cp_count},\"workers\":{\"machineDeployments\":[{\"class\":\"default-worker\",\"name\":\"md-0\",\"replicas\":$workers}]}}}}"
+            else
+              machine_type="${HYVE_PARAM_MACHINE_TYPE:-e2-medium}"
+              echo "Patching $ns/$name: version $version, $workers x $machine_type"
+              mk patch "$cluster_res" "$name" --type merge -p "{\"spec\":{\"topology\":{\"version\":\"$version\",\"workers\":{\"machinePools\":[{\"class\":\"default-worker\",\"name\":\"mp-0\",\"replicas\":$workers}]},\"variables\":[{\"name\":\"machineType\",\"value\":\"$machine_type\"}]}}}"
+            fi
