@@ -1,0 +1,165 @@
+# Reference ClusterClass for hyve-capi-module's flavor: gke — managed GKE
+# clusters created by Cluster API's GCP provider (CAPG), with one worker
+# MachinePool class. Adapted from CAPG v1.12.0's
+# cluster-template-gke-clusterclass.yaml.
+#
+# Where the cluster goes is set per cluster through topology variables
+# (params.variables):
+#   project  — GCP project ID (required)
+#   location — the control plane's location: a zone (us-central1-a) for a
+#              zonal cluster, or a region for a regional one (required)
+#   region   — the region networking lives in (required)
+#   machineType — the worker nodes' machine type (default e2-medium; the
+#              module's params.machine_type sets it)
+# e.g. variables: "project=my-project;location=us-central1-a;region=us-central1"
+#
+# Zonal clusters: CAPG v1.12 looks node pools up by region, so it can't
+# reconcile a zonal cluster's node pool after create — changing
+# worker_count/machine_type/version later isn't applied. Use a region for
+# location if you'll need that.
+#
+# No namespaces: apply with -n (the module's params.cluster_class_path
+# does). Needs the gcp infrastructure provider with EXP_CAPG_GKE=true and
+# EXP_MACHINE_POOL=true, plus CLUSTER_TOPOLOGY=true.
+apiVersion: cluster.x-k8s.io/v1beta2
+kind: ClusterClass
+metadata:
+  name: gke
+spec:
+  controlPlane:
+    templateRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      kind: GCPManagedControlPlaneTemplate
+      name: gke-control-plane
+  infrastructure:
+    templateRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      kind: GCPManagedClusterTemplate
+      name: gke-cluster
+  workers:
+    machinePools:
+      - class: default-worker
+        bootstrap:
+          templateRef:
+            apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+            kind: GKEConfigTemplate
+            name: gke-default-worker
+        infrastructure:
+          templateRef:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+            kind: GCPManagedMachinePoolTemplate
+            name: gke-default-worker
+  variables:
+    - name: project
+      required: true
+      schema:
+        openAPIV3Schema:
+          type: string
+          description: GCP project ID the cluster is created in.
+    - name: location
+      required: true
+      schema:
+        openAPIV3Schema:
+          type: string
+          description: The control plane's location — a zone for a zonal cluster, a region for a regional one.
+    - name: region
+      required: true
+      schema:
+        openAPIV3Schema:
+          type: string
+          description: The region the cluster's networking lives in.
+    - name: machineType
+      required: false
+      schema:
+        openAPIV3Schema:
+          type: string
+          default: e2-medium
+          description: GCE machine type for the worker pool's nodes.
+  patches:
+    - name: location
+      description: Puts the cluster in the given project, location, and region.
+      definitions:
+        - selector:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+            kind: GCPManagedControlPlaneTemplate
+            matchResources:
+              controlPlane: true
+          jsonPatches:
+            - op: add
+              path: /spec/template/spec/project
+              valueFrom:
+                variable: project
+            - op: add
+              path: /spec/template/spec/location
+              valueFrom:
+                variable: location
+        - selector:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+            kind: GCPManagedClusterTemplate
+            matchResources:
+              infrastructureCluster: true
+          jsonPatches:
+            - op: add
+              path: /spec/template/spec/project
+              valueFrom:
+                variable: project
+            - op: add
+              path: /spec/template/spec/region
+              valueFrom:
+                variable: region
+    - name: machineType
+      description: Sets the worker pool's machine type.
+      definitions:
+        - selector:
+            apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+            kind: GCPManagedMachinePoolTemplate
+            matchResources:
+              machinePoolClass:
+                names:
+                  - default-worker
+          jsonPatches:
+            - op: add
+              path: /spec/template/spec/machineType
+              valueFrom:
+                variable: machineType
+---
+# project/location/region are filled in by the ClusterClass's patches; the
+# placeholders only satisfy the templates' own required fields.
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: GCPManagedControlPlaneTemplate
+metadata:
+  name: gke-control-plane
+spec:
+  template:
+    spec:
+      project: set-by-clusterclass
+      location: set-by-clusterclass
+      releaseChannel: regular
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: GCPManagedClusterTemplate
+metadata:
+  name: gke-cluster
+spec:
+  template:
+    spec:
+      project: set-by-clusterclass
+      region: set-by-clusterclass
+      network:
+        name: default
+---
+apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+kind: GCPManagedMachinePoolTemplate
+metadata:
+  name: gke-default-worker
+spec:
+  template:
+    spec: {}
+---
+apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+kind: GKEConfigTemplate
+metadata:
+  name: gke-default-worker
+spec:
+  template:
+    spec: {}

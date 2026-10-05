@@ -2,93 +2,168 @@
 
 A [hyve](https://github.com/cbridges1/hyve) driver module for Kubernetes
 clusters built by [Cluster API](https://cluster-api.sigs.k8s.io/) from a
-ClusterClass. hyve creates, scales, upgrades, deletes, and authenticates to
-them by driving `Cluster` objects on a CAPI management cluster with
-`kubectl`; CAPI's own controllers do the machine-level work.
+ClusterClass, on any provider Cluster API supports. hyve creates, scales,
+upgrades, deletes, and authenticates to them by driving `Cluster` objects
+on a CAPI management cluster with `kubectl`; CAPI's controllers do the
+machine-level work.
 
-Reference from a cluster definition as:
+Nothing in it is tied to one installation: each template or cluster says
+which management cluster and ClusterClass to use.
+
+## Quick start
+
+On an existing management cluster that hyve knows as `capi-mgmt`, with a
+ClusterClass `my-class` installed in `capi-clusters`:
+
+```yaml
+apiVersion: hyve.io/v1alpha1
+kind: Template
+metadata:
+  name: aws-small
+spec:
+  driver:
+    source: github.com/cbridges1/hyve-capi-module
+    version: v0.2.0
+  mgmtCluster: capi-mgmt
+  params:
+    cluster_class: my-class
+    kubernetes_version: v1.34.8
+    control_plane_count: "3"
+    worker_count: "2"
+    variables: "region=us-east-1;instanceType=t3.large"
+```
+
+Locally or in a pipeline, with no management cluster at all — the module
+makes a kind cluster, installs Cluster API and the Docker provider, applies
+the reference ClusterClass, and builds a cluster of Docker containers:
 
 ```yaml
 spec:
   driver:
     source: github.com/cbridges1/hyve-capi-module
-    version: latest
-  dependsOn:
-    - unraid-k3s          # the management cluster — wait for it first
+    version: v0.2.0
   params:
-    flavor: gke
-    worker_count: "1"
+    management: kind
+    providers: docker
+    flavor: capd
+    cluster_class_path: <path to this repo>/clusterclasses/capd
 ```
-
-## Flavors
-
-| `flavor` | Clusters | ClusterClass it expects |
-|---|---|---|
-| `capd` (default) | Docker containers on the management node (CAPD): kubeadm control plane, MachineDeployment workers, flannel CNI, reached through a NodePort relay | `capd` |
-| `gke` | Managed GKE (CAPG, experimental GKE support): MachinePool workers, GKE's own CNI and public endpoint | `gke` |
 
 ## The management cluster
 
-`module.yaml`'s `requirements.mgmtCluster` names the hyve cluster that runs
-Cluster API — `unraid-k3s`. hyve gives every op `HYVE_MGMT_KUBECONFIG`, a
-kubeconfig for it (that cluster's own auth kubeconfig, or a freshly minted
-one when hyve itself runs on it). It isn't a param: a management cluster
-with another name needs a fork or a different version of this module.
+`params.management` picks where the cluster's CAPI objects live:
 
-It must have, in the `namespace` param's namespace (default `capi-clusters`):
+| `management` | Management cluster | Where it works |
+|---|---|---|
+| `hyve` (default) | The hyve cluster named by the template's or cluster's `spec.mgmtCluster` (`hyve template create --mgmt-cluster`); hyve passes its kubeconfig as `HYVE_MGMT_KUBECONFIG` | Local and cluster mode |
+| `kubeconfig` | The cluster in the kubeconfig file at `params.mgmt_kubeconfig` | Local mode, pipelines |
+| `kind` | A kind cluster on this machine, `params.kind_cluster` (default `hyve-capi`), created by the first `create` | Local mode, pipelines — needs Docker, `kind`, and `clusterctl` |
 
-- **`capd`:** CAPI core with ClusterTopology on, the kubeadm bootstrap and
-  control-plane providers, the Docker provider (which needs the node's
-  Docker socket), a `capd` ClusterClass with one `default-worker`
-  MachineDeployment class and an `extraCertSANs` (string array) variable,
-  and a ClusterResourceSet that installs a CNI on Clusters labeled
-  `cni: flannel` (pod CIDR `10.244.0.0/16`).
-- **`gke`:** the GCP provider with its GKE and MachinePool features on, and
-  a `gke` ClusterClass with one `default-worker` MachinePool class and a
-  `machineType` (string) variable.
+The management cluster needs Cluster API (with `CLUSTER_TOPOLOGY=true`),
+the providers your ClusterClass uses, and the ClusterClass itself in
+`params.namespace` (default `capi-clusters`). Under `hyve` and
+`kubeconfig` you install those; under `kind` the module does:
 
-The reference setup — Rancher Turtles `CAPIProvider`s, both ClusterClasses,
-and the flannel ClusterResourceSet — is `argo/capi/` in
-nexus-configuration.
+- `params.providers` — clusterctl infrastructure providers, comma-separated
+  (`docker`, `gcp`, `aws`, `azure`, …), each optionally pinned
+  (`docker:v1.12.7`). Only missing ones are installed.
+- `params.capi_version` — the Cluster API version (core and kubeadm
+  providers, e.g. `v1.12.7`); unset, `clusterctl` installs the latest. Pin
+  it in pipelines.
+  Credentials come from the environment the way `clusterctl init` expects
+  (e.g. `GCP_B64ENCODED_CREDENTIALS`, `AWS_B64ENCODED_CREDENTIALS`);
+  `params.init_env` (`KEY=VALUE;…`) adds anything else, such as
+  `EXP_CAPG_GKE=true`.
+- `params.cluster_class_path` — ClusterClass manifests (file, directory, or
+  URL), applied on every create. Usable under any `management` mode.
+
+The kind cluster is persistent and shared by every cluster that names it,
+because it holds their CAPI objects: delete it while a cloud cluster is up
+and that cluster is orphaned (still running, no longer managed). Set
+`params.kind_cleanup: "true"` to delete it automatically once its last
+Cluster is gone — for pipelines that create and tear down.
+
+The module never edits `~/.kube/config`; the kind cluster's kubeconfig is
+fetched fresh for each operation (`kind get kubeconfig --name <name>`).
+
+## The cluster
+
+| Param | Default | |
+|---|---|---|
+| `cluster_class` | by `flavor` | Required otherwise. Fixed at create |
+| `kubernetes_version` | by `flavor` | Required otherwise |
+| `worker_count` | `1` | Replicas of the one worker (`md-0` or `mp-0`) |
+| `worker_type` | `machineDeployment` | Or `machinePool`, matching how the ClusterClass defines workers |
+| `worker_class` | `default-worker` | The ClusterClass's worker class |
+| `control_plane_count` | by `flavor` | For a machine-based control plane; unset for a managed one |
+| `variables` | | Topology variables, `name=value;name=value` — values are raw YAML (`e2-small`, `3`, `[a, b]`, `{k: v}`) |
+| `labels` | by `flavor` | Cluster labels, `key=value,…` (e.g. to match a ClusterResourceSet) |
+| `pod_cidr`, `service_cidr` | by `flavor` | `spec.clusterNetwork`, if the ClusterClass needs it |
+| `namespace` | `capi-clusters` | Fixed at create |
+
+`flavor` fills in defaults for the reference ClusterClasses in
+`clusterclasses/` — every one can still be set explicitly:
+
+| `flavor` | ClusterClass | Defaults |
+|---|---|---|
+| `capd` | `clusterclasses/capd` — Docker nodes (CAPD), kubeadm control plane, flannel via a ClusterResourceSet | `v1.34.8`, 1 control plane, label `cni=flannel`, pod CIDR `10.244.0.0/16`, the relay address in `extraCertSANs` |
+| `gke` | `clusterclasses/gke` — managed GKE (CAPG), one MachinePool | `v1.35.8`, `worker_type: machinePool`, `machineType` from `params.machine_type` (default `e2-medium`). Also set `variables: "project=…;location=…;region=…"` |
+
+## Reaching the API server
+
+`auth` writes CAPI's admin kubeconfig (Secret `<name>-kubeconfig`).
+`params.api_access` decides how hyve and kubectl reach the API server:
+
+- `direct` — the endpoint as CAPI reports it (public endpoints: GKE, EKS, …).
+- `nodeport` — a NodePort relay on the management cluster (a selector-less
+  Service plus EndpointSlice, owned by the Cluster), for an endpoint only
+  its nodes can route to, such as CAPD on a remote Docker host. Reached at
+  `params.api_host` (default the management cluster's first node IP).
+- `docker` — the port Docker publishes on this machine for CAPD's load
+  balancer container, under `management: kind`.
+- `auto` (default) — `direct` for a public endpoint; for a private one,
+  `docker` under `management: kind`, else `nodeport`.
+
+Through a relay the kubeconfig keeps verifying the certificate against the
+original endpoint (`tls-server-name`), so no extra certificate names are
+needed.
 
 ## Operations
 
 | Op | What it does |
 |---|---|
-| `create` | Applies a `Cluster` with `spec.topology` (ClusterClass, version, worker count). `capd`: control plane count, the `cni: flannel` label, and the management node's IP baked into the API server certificate. `gke`: MachinePool workers and the `machineType` variable. Returns immediately. |
-| `status` | `NOT_FOUND` / `CREATING` / `UPDATING` / `ACTIVE` / `DELETING` / `FAILED` from the Cluster's conditions — ACTIVE needs `Available` with nothing in flight (not just phase `Provisioned`). An unreachable management cluster is an error, never `NOT_FOUND`. |
-| `scale` | Any param change: one patch of the topology's version (an upgrade) and worker count — plus control plane count (`capd`) or machine type (`gke`). |
-| `auth` | Writes CAPI's admin kubeconfig (Secret `<name>-kubeconfig`). If the API endpoint is a private address (CAPD's, on the management node's Docker network, which only the node can route to), it first creates a NodePort relay on the management cluster — a selector-less Service plus EndpointSlice, owned by the Cluster — and points the kubeconfig at `<node IP>:<nodePort>`. A public endpoint (GKE) is used as is. |
-| `delete` | Deletes the Cluster and waits (up to 14 min, under cluster mode's 15-minute Job deadline) until it's gone; the relay goes with it. |
-
-## Params
-
-| Param | Default | |
-|---|---|---|
-| `flavor` | `capd` | `capd` or `gke`. Fixed at create |
-| `kubernetes_version` | `v1.34.8` (capd), `v1.35.8` (gke) | capd: a `kindest/node` tag must exist. gke: a version GKE's channel offers |
-| `worker_count` | `1` | capd's `md-0` MachineDeployment or gke's `mp-0` MachinePool |
-| `control_plane_count` | `1` | capd only |
-| `machine_type` | `e2-medium` | gke only |
-| `cluster_class` | by flavor | Fixed at create |
-| `namespace` | `capi-clusters` | Fixed at create |
-| `api_host` | management node IP | capd only. Fixed at create (it's in the certificate) |
+| `create` | (`kind`: makes sure the kind cluster, Cluster API, and providers exist.) Applies `cluster_class_path` if set, then a `Cluster` with `spec.topology` from the params. Returns immediately |
+| `status` | `NOT_FOUND` / `CREATING` / `UPDATING` / `ACTIVE` / `DELETING` / `FAILED` from the Cluster's conditions — ACTIVE needs `Available` with nothing in flight. An unreachable management cluster is an error, never `NOT_FOUND` |
+| `scale` | Any param change: one patch of the topology — version (an upgrade), replicas, variables. The class stays |
+| `auth` | Writes the cluster's kubeconfig, through a relay when needed (above) |
+| `delete` | Deletes the Cluster and waits (up to 14 min, under cluster mode's 15-minute Job deadline) until it's gone |
 
 ## Tested
 
-Against a kind management cluster with CAPI v1.12.7 (2026-09-30/10-01):
-capd end-to-end — create, status, auth (relay + TLS), scale up/down, an
-upgrade v1.34.8 → v1.35.5, delete. gke as far as it goes without GCP
-credentials — the ClusterClass and the module's Cluster validate, and the
-topology controller produces the right GKE objects; CAPG then fails on the
-dummy credentials. Not yet run against real GCP.
+2026-10-04, hyve with `spec.mgmtCluster` support:
 
-## Notes
+- `management: kind` end to end on macOS (Docker Desktop, kind v0.32,
+  clusterctl v1.12.7): created the kind cluster, installed Cluster API and
+  the Docker provider, applied `clusterclasses/capd`, built a capd cluster
+  (ACTIVE in about a minute), reached it via `api_access: docker`, scaled
+  it to two workers, deleted it, and `kind_cleanup` removed the kind
+  cluster.
+- `management: hyve` against a CAPI v1.12.7 management cluster with CAPG:
+  `status`; a flavor gke Cluster rendered by `create` passes a server-side
+  dry run against the gke ClusterClass; both reference ClusterClasses pass
+  one too.
 
-- Moved out of nexus-configuration's `modules/capi/` into its own repo so
-  it's a git-sourced module, which cluster-mode hyve can use (it doesn't
-  resolve paths inside a consuming repo).
-- Each op inlines its own setup instead of sourcing a shared file — hyve
-  runs a module's scripts with the consuming repo's root as the working
-  directory.
-- CAPD is a development provider; GKE support in CAPG is experimental.
+Not yet run: a real GKE cluster from `clusterclasses/gke`, and the
+`nodeport` relay since the move to `tls-server-name`.
+
+## Developing
+
+The operation files (`create.yaml`, …) are generated — hyve runs each op as
+a standalone script (in cluster mode, inside a Job), so they can't share a
+file, and the shared blocks are inlined. Edit `gen/connect.sh` (finding the
+management cluster), `gen/spec.sh` (params to the desired topology), or
+`gen/ops/*.sh`, then:
+
+```sh
+python3 gen/gen.py .
+```

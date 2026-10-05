@@ -2,64 +2,114 @@ apiVersion: v1
 kind: Module
 metadata:
   name: capi
-  version: 0.1.0
+  version: 0.2.0
   description: >-
-    Kubernetes clusters built by Cluster API from a ClusterClass on a CAPI
-    management cluster — hyve creates, scales, upgrades, deletes, and
-    authenticates to them by driving that cluster's Cluster objects with
-    kubectl; CAPI's own controllers do the machine-level work. Two flavors,
-    each needing a matching ClusterClass on the management cluster: capd
-    (Docker nodes, via CAPD) and gke (managed GKE, via CAPG). Every
-    op talks to the management cluster through HYVE_MGMT_KUBECONFIG, which
-    hyve provides because of requirements.mgmtCluster below.
+    Kubernetes clusters built by Cluster API from a ClusterClass, on any
+    provider CAPI supports — hyve creates, scales, upgrades, deletes, and
+    authenticates to them by driving Cluster objects on a CAPI management
+    cluster with kubectl; CAPI's controllers do the machine-level work. The
+    management cluster is a hyve cluster (spec.mgmtCluster), any kubeconfig,
+    or a kind cluster this module creates on the machine it runs on.
   author: Hyve
   license: MIT
   tags:
     - cluster-api
-    - capd
     - kubernetes
   type: driver
 spec:
   runner:
-    # Cluster mode: kubectl plus a POSIX shell and base64.
+    # Cluster mode: kubectl plus a POSIX shell and base64. management: kind
+    # can't run here (no Docker) — it's for local mode and pipelines.
     image: alpine/k8s:1.34.12
   params:
+    # --- the cluster ---
+    - name: cluster_class
+      description: ClusterClass to build the cluster from, in params.namespace on the management cluster. Required unless params.flavor sets it.
+    - name: kubernetes_version
+      description: Kubernetes version (e.g. v1.34.8). Required unless params.flavor sets it.
+    - name: worker_count
+      description: Worker replicas
+      default: "1"
+    - name: worker_type
+      description: How the ClusterClass defines workers — machineDeployment or machinePool. Default machineDeployment (flavor gke uses machinePool).
+    - name: worker_class
+      description: The ClusterClass's worker class to use
+      default: default-worker
+    - name: control_plane_count
+      description: Control plane replicas, for a ClusterClass with a machine-based control plane. Leave unset for a managed one (GKE, EKS, AKS).
+    - name: variables
+      description: >-
+        Topology variables, "name=value;name=value" — each value raw YAML
+        (a string, a number, [a, b], {k: v}). E.g. for the reference gke
+        ClusterClass: "project=my-project;location=us-central1-a;region=us-central1".
+    - name: labels
+      description: Labels for the Cluster, "key=value,key=value" (e.g. to match a ClusterResourceSet)
+    - name: pod_cidr
+      description: Pod network CIDR (spec.clusterNetwork), if the ClusterClass needs one
+    - name: service_cidr
+      description: Service network CIDR (spec.clusterNetwork), if the ClusterClass needs one
+    - name: namespace
+      description: Management-cluster namespace holding the ClusterClass and the cluster's objects. Fixed at create.
+      default: capi-clusters
     - name: flavor
       description: >-
-        capd (Docker nodes: kubeadm control plane, MachineDeployment workers,
-        flannel, NodePort relay) or gke (managed GKE: MachinePool workers,
-        GKE's own CNI and public endpoint). Fixed at create.
-      default: capd
-      choices: [capd, gke]
-    - name: cluster_class
-      description: ClusterClass to build the cluster from, in the namespace below (default capd or gke, by flavor)
-    - name: kubernetes_version
-      description: >-
-        Kubernetes version. capd (default v1.34.8): a kindest/node image tag
-        must exist for it. gke (default v1.35.8): a version the gke
-        ClusterClass's GKE release channel offers in its location.
-    - name: control_plane_count
-      description: Control plane machines (capd only — GKE manages its own)
-      default: "1"
-    - name: worker_count
-      description: Worker nodes (capd's md-0 MachineDeployment, or gke's mp-0 MachinePool)
-      default: "1"
+        Defaults for one of the reference ClusterClasses in clusterclasses/
+        — capd (Docker nodes) or gke (managed GKE); every value it sets can
+        still be given explicitly. Leave unset for any other ClusterClass.
+      choices: ["", capd, gke]
     - name: machine_type
-      description: GCE machine type for gke worker nodes
+      description: Worker machine type for flavor gke (sets its machineType variable)
       default: e2-medium
-    - name: namespace
-      description: Management-cluster namespace holding the ClusterClass and the cluster's objects
-      default: capi-clusters
-    - name: api_host
+
+    # --- the management cluster ---
+    - name: management
       description: >-
-        Address hyve and kubectl reach the cluster's API server on. Defaults
-        to the management cluster's node IP (see auth.yaml's NodePort relay).
-        capd only.
+        Where the cluster's CAPI objects live: hyve (the template/cluster's
+        spec.mgmtCluster), kubeconfig (params.mgmt_kubeconfig), or kind (a
+        kind cluster on this machine — local mode only).
+      default: hyve
+      choices: [hyve, kubeconfig, kind]
+    - name: mgmt_kubeconfig
+      description: Path to the management cluster's kubeconfig, for management kubeconfig
+    - name: kind_cluster
+      description: Name of the kind management cluster, for management kind — shared by every cluster that names it
+      default: hyve-capi
+    - name: kind_node_image
+      description: kindest/node image for the kind management cluster (default kind's own)
+    - name: providers
+      description: >-
+        clusterctl infrastructure providers to install on the kind
+        management cluster, comma-separated (docker, gcp, aws, azure, ...),
+        each optionally pinned (docker:v1.12.7).
+        Credentials come from the environment, as clusterctl expects (e.g.
+        GCP_B64ENCODED_CREDENTIALS).
+    - name: capi_version
+      description: Cluster API version to install on the kind management cluster (core and kubeadm providers, e.g. v1.12.7); unset installs the latest
+    - name: init_env
+      description: Extra environment for clusterctl init, "KEY=VALUE;KEY=VALUE" (e.g. EXP_CAPG_GKE=true)
+    - name: cluster_class_path
+      description: >-
+        ClusterClass manifests to apply on every create — a file, a
+        directory, or a URL, relative paths from the repository hyve runs
+        in. Needed for a fresh kind cluster.
+    - name: kind_cleanup
+      description: '"true" deletes the kind management cluster once its last Cluster is deleted (pipelines)'
+
+    # --- reaching the API server ---
+    - name: api_access
+      description: >-
+        How to reach the cluster's API server: auto (default), direct,
+        nodeport (a relay on the management cluster, for an endpoint only
+        its nodes can route to), or docker (the port Docker publishes for
+        CAPD's load balancer, under management kind).
+      default: auto
+      choices: [auto, direct, nodeport, docker]
+    - name: api_host
+      description: Address the nodeport relay is reached on (default the management cluster's first node IP; under flavor capd it's also put in the API server's certificate)
   requirements:
-    # The hyve cluster (in the consuming repo) that runs Cluster API and
-    # this module's ClusterClasses. hyve reads it from here, not from
-    # params, so a different name means a fork or a different version.
-    mgmtCluster: unraid-k3s
+    # No requirements.mgmtCluster: each template or cluster names its own
+    # (spec.mgmtCluster), so this module carries nothing specific to one
+    # installation.
     tools:
       - name: kubectl
         description: Kubernetes CLI — every op talks to the management cluster with it
